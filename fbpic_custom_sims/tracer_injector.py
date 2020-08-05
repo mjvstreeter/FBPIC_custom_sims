@@ -927,10 +927,10 @@ class TracerDiagnostic(TracksOpenPMDDiagnostic) :
 
         # If this is the momentum, multiply by the proper factor
         # (only for species that have a mass)
-        if quantity in ['ux', 'uy', 'uz']:
-            if species.m>0:
-                scale_factor = species.m * constants.c
-                quantity_one_proc = quantity_one_proc*scale_factor
+        # if quantity in ['ux', 'uy', 'uz']:
+        #     if species.m>0:
+        #         scale_factor = species.m * constants.c
+        #         quantity_one_proc = quantity_one_proc*scale_factor
         if self.comm is not None:
             quantity_all_proc = self.comm.gather_ptcl_array(
                 quantity_one_proc, n_rank, Ntot )
@@ -939,5 +939,172 @@ class TracerDiagnostic(TracksOpenPMDDiagnostic) :
 
         # Return the results
         return( quantity_all_proc )
+
+
+class CustomInjector( object ):
+    """
+    Class that stores a number of attributes that are needed for
+    custom injection by a moving window.
+    """
+
+    def __init__(self,user_p_data,
+            n,dens_func=None):
+        """
+        Initialize continuous injection
+
+        Parameters
+        ----------
+        user_p_data is a 6 x N array containing (x,y,z,ux,uy,uz) values for N particles
+        """
+        # Register properties of the injected plasma
+        self.user_p_data = user_p_data
+        self.N_p = np.shape(user_p_data)[1]
+        self.p_injected = np.zeros(self.N_p)
+        self.n=n
+        self.dens_func = dens_func
+
+        self.p_trace_data = None
+
+
+        # Register variables that define the positions
+        # where the plasma is injected.
+        p_gamma = np.sqrt(1 + np.sum(user_p_data[3:,:]**2,axis=0))
+
+        # These variables are set by `initialize_injection_positions`
+        self.z_inject = None
+        self.z_end_plasma = None
+
+
+    def initialize_injection_positions( self, comm, v_moving_window,
+                                        species_z, dt ):
+        """
+        Initialize the positions that keep track of the injection of particles.
+        This is automatically called at the beginning of `step`.
+
+        Parameters
+        ----------
+        comm: a BoundaryCommunicator object
+            Contains information about grid MPI decomposition
+        v_moving_window: float (in m/s)
+            The speed of the moving window
+        species_z: 1darray of float (in m)
+            (One element per macroparticle)
+            Used in order to infer the position of the end of the plasma
+        dt: float (in s)
+            Timestep of the simulation
+        """
+        # The injection position is only initialized for the last proc
+        if comm.rank != comm.size-1:
+            return
+        # Initialize the injection position only if it has not be initialized
+        if self.z_inject is not None:
+            return
+
+        # Initialize plasma *ahead* of the right *physical*
+        # boundary of the box in the damping region (including the
+        # injection area) so that after `exchange_period` iterations
+        # (without adding new plasma), there will still be plasma
+        # inside the physical domain and the damping region (without the
+        # injection area). This ensures that there are never particles in the
+        # rightmost guard region and that there are always particles inside
+        # the damped region, where the field can be non-zero. New particles,
+        # which are injected in the Injection region, do not see any fields.
+        _, zmax_global_domain_with_damp = comm.get_zmin_zmax( local=False,
+                                    with_damp=True, with_guard=False )
+        self.z_inject = zmax_global_domain_with_damp \
+                + (3-comm.n_inject)*comm.dz \
+                + comm.exchange_period*dt*(v_moving_window)
+   
+        _, zmax_global_physical_domain = comm.get_zmin_zmax( local=False,
+                                    with_damp=False, with_guard=False )
+        self.z_end_plasma = zmax_global_physical_domain
+        self.p_vol = comm.dz**3
+
+
+    def reset_injection_positions( self ):
+        """
+        Reset the variables that keep track of continuous injection to `None`
+        This is typically called when restarting a simulation from a checkpoint
+        """
+        self.nz_inject = None
+        self.z_inject = None
+        self.z_end_plasma = None
+
+    def increment_injection_positions( self, v_moving_window, duration ):
+        """
+        Update the positions between which the new particles will be generated,
+        the next time when `generate_particles` is called.
+        This function is automatically called when the moving window moves.
+
+        Parameters
+        ----------
+        v_moving_window: float (in m/s)
+            The speed of the moving window
+
+        duration: float (in seconds)
+            The duration since the last time that the moving window moved.
+        """
+        # Move the injection position
+        self.z_inject += v_moving_window * duration
+       
+
+
+    def generate_particles( self, time ):
+        """
+        Generate new particles at the right end of the plasma
+        (i.e. between z_end_plasma - nz_inject*dz and z_end_plasma)
+
+        Parameters
+        ----------
+        time: float (in second)
+            The current physical time of the simulation
+        """
+        # Create a temporary density function that takes into
+        # account the fact that the plasma has moved
+        if self.dens_func is not None:
+            def dens_func( z, x,y):
+                return( self.dens_func( z-self.v_end_plasma*time, x,y ) )
+            dens_func = None
+
+        # Create new particle cells
+        # Determine the positions between which new particles will be created
+        zmax = self.z_inject
+        
+
+        p_select = (self.user_p_data[2,:]<zmax)*(self.p_injected<1)
+        N_select = np.sum(p_select)
+        self.p_injected = self.p_injected + p_select
+        p_data = self.user_p_data[:,p_select]
+        # Create the particles
+        if N_select>0:
+    
+            x = p_data[0,:].flatten()
+            y = p_data[1,:].flatten()
+            z = p_data[2,:].flatten()
+            uz = p_data[0,:].flatten()
+            ux = p_data[1,:].flatten()
+            uy = p_data[2,:].flatten()
+            inv_gamma = 1./np.sqrt( 1 + ux**2 + uy**2 + uz**2 )
+            Ntot = len(x)
+            w = self.n * self.p_vol*np.ones_like(x)
+            # Modulate it by the density profile
+            if dens_func is not None :
+                w *= dens_func( z, x,y )
+            
+        else:
+            Ntot = 0
+            x = np.empty(0)
+            y = np.empty(0)
+            z = np.empty(0)
+            ux = np.empty(0)
+            uy = np.empty(0)
+            uz = np.empty(0)
+            inv_gamma = np.empty(0)
+            w = np.empty(0)
+
+        return( Ntot, x, y, z, ux, uy, uz, inv_gamma, w )
+
+
+
 
 
